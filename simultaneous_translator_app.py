@@ -58,6 +58,11 @@ class SimultaneousTranslatorApp:
         # 初始化 Pygame Mixer 标记
         self.mixer_initialized = False
 
+        # ASR Stuck detection
+        self.ASR_MAX_INTERIM_DURATION = 5.0  # 5 seconds
+        self.asr_interim_stuck_timer_id = None
+        self.current_interim_start_time = None
+
         # Initialize Translation Module
         if TranslationModule and TRANSLATION_APP_ID != "YOUR_APP_ID" and TRANSLATION_API_KEY != "YOUR_API_KEY" and TRANSLATION_API_SECRET != "YOUR_API_SECRET":
             self.translation_instance = TranslationModule(
@@ -510,6 +515,9 @@ class SimultaneousTranslatorApp:
                 self.log_message(f"停止FunASR时出错: {e}")
 
         self.is_running = False # Set to false to signal worker threads to stop
+        self._cancel_interim_stuck_check() # Cancel ASR stuck timer
+        self.current_interim_start_time = None
+
         self.start_stop_button.config(text="开始同传")
 
         # Clear queues after stopping ASR and setting is_running to false
@@ -528,6 +536,9 @@ class SimultaneousTranslatorApp:
         if not self.is_running: return
 
         if is_sentence_end:
+            self._cancel_interim_stuck_check() # Cancel timer if sentence ends naturally
+            self.current_interim_start_time = None
+
             final_text = current_full_sentence.strip()
             if final_text and final_text != self.last_final_asr_text:
                 self.log_message(f"ASR (Final): {final_text}")
@@ -538,17 +549,31 @@ class SimultaneousTranslatorApp:
                 self.recognized_text_has_interim = False
             elif not final_text:
                  self.log_message(f"ASR (Final Empty Ignored)")
-                 if self.recognized_text_has_interim:
+                 if self.recognized_text_has_interim: # Make sure to clear if it was interim
                     self.root.after(0, lambda: self._update_text_area(self.recognized_text_area, "", mode='clear_interim'))
                  self.recognized_text_has_interim = False
-            else:
+            else: # Duplicate final
                 self.log_message(f"ASR (Duplicate Final Ignored): {final_text}")
+                # Ensure consistent state even for duplicates if it followed an interim
+                if self.recognized_text_has_interim:
+                    self.root.after(0, lambda: self._update_text_area(self.recognized_text_area, self.last_final_asr_text + "\n" if self.last_final_asr_text else "", mode='replace_interim_with_final')) # show last valid final
+                self.recognized_text_has_interim = False
             self.current_recognized_sentence = ""
-        else:
+        else: # Interim result
+            # If self.recognized_text_has_interim was False, it means we are starting a new interim segment.
+            if not self.recognized_text_has_interim and current_full_sentence: # Start timer only if there's content
+                self.current_interim_start_time = time.time()
+                self._schedule_interim_stuck_check() # Schedule check
+            
             self.current_recognized_sentence = current_full_sentence
             self.log_message(f"ASR (Interim): {recognized_segment}")
             self.root.after(0, lambda: self._update_text_area(self.recognized_text_area, self.current_recognized_sentence, mode='update_interim'))
-            self.recognized_text_has_interim = True
+            if current_full_sentence: # Only set to True if there's actual interim content
+                self.recognized_text_has_interim = True
+            else: # If interim content becomes empty, treat as no interim
+                self.recognized_text_has_interim = False
+                self._cancel_interim_stuck_check()
+                self.current_interim_start_time = None
 
     def translation_worker(self):
         while True:
@@ -705,6 +730,77 @@ class SimultaneousTranslatorApp:
         self.log_message("正在销毁UI...")
         self.root.destroy()
         print("应用已关闭。")
+
+    def _schedule_interim_stuck_check(self):
+        self._cancel_interim_stuck_check() # Cancel any existing timer
+        if self.is_running and self.recognized_text_has_interim and self.current_interim_start_time is not None:
+            # Schedule the check after ASR_MAX_INTERIM_DURATION milliseconds
+            check_delay_ms = int(self.ASR_MAX_INTERIM_DURATION * 1000)
+            self.asr_interim_stuck_timer_id = self.root.after(check_delay_ms, self._check_interim_stuck)
+            self.log_message(f"ASR interim stuck check scheduled in {self.ASR_MAX_INTERIM_DURATION}s.")
+
+    def _cancel_interim_stuck_check(self):
+        if self.asr_interim_stuck_timer_id:
+            self.root.after_cancel(self.asr_interim_stuck_timer_id)
+            self.asr_interim_stuck_timer_id = None
+            # self.log_message("ASR interim stuck check cancelled.") # Optional: for debugging
+
+    def _check_interim_stuck(self):
+        self.asr_interim_stuck_timer_id = None # Timer has fired
+        if self.is_running and self.recognized_text_has_interim and self.current_interim_start_time is not None:
+            elapsed_interim_time = time.time() - self.current_interim_start_time
+            # Using a small buffer (e.g., 0.1s) to account for scheduling precision
+            if elapsed_interim_time >= self.ASR_MAX_INTERIM_DURATION - 0.1:
+                self.log_message(f"ASR超时: 中间结果持续 {elapsed_interim_time:.2f} 秒未结束，强制结束当前句段。")
+                self.force_end_current_asr_segment()
+            else:
+                # This case should ideally not happen if 'after' is precise,
+                # but if it does, reschedule with remaining time.
+                # However, simpler is to rely on the initial scheduling.
+                # For now, we assume if it fires, the duration has passed.
+                # If not, it might be due to heavy load; forcing end might still be beneficial.
+                # Consider logging this specific case if it occurs.
+                self.log_message(f"ASR interim check fired, elapsed: {elapsed_interim_time:.2f}s. Forcing.")
+                self.force_end_current_asr_segment()
+
+        # Do not reschedule from here; it's scheduled only when a new interim phase starts.
+
+    def force_end_current_asr_segment(self):
+        if self.is_running and self.recognized_text_has_interim and self.current_recognized_sentence:
+            final_forced_text = self.current_recognized_sentence.strip()
+            if not final_forced_text: # Don't process if the interim sentence became empty
+                self.log_message("尝试强制结束ASR片段，但当前中间文本为空。清理状态。")
+                if self.recognized_text_has_interim:
+                    self.root.after(0, lambda: self._update_text_area(self.recognized_text_area, "", mode='clear_interim'))
+                self.recognized_text_has_interim = False
+                self.current_recognized_sentence = ""
+                self._cancel_interim_stuck_check()
+                self.current_interim_start_time = None
+                return
+
+            self.log_message(f"强制结束ASR片段: {final_forced_text}")
+
+            self.last_final_asr_text = final_forced_text
+            # Since we are forcing an end *because* we were in an interim state,
+            # mode should be 'replace_interim_with_final'.
+            self.root.after(0, lambda ff_text=final_forced_text: self._update_text_area(self.recognized_text_area, ff_text + "\n", mode='replace_interim_with_final'))
+            self.asr_output_queue.put(final_forced_text)
+            
+            self.recognized_text_has_interim = False
+            self.current_recognized_sentence = ""
+            
+            # Ensure timer and related state are reset
+            self._cancel_interim_stuck_check()
+            self.current_interim_start_time = None
+        else:
+            self.log_message("尝试强制结束ASR片段，但无有效进行中的中间片段或应用未运行。")
+            # Defensive cleanup
+            if self.is_running and self.recognized_text_has_interim:
+                 self.root.after(0, lambda: self._update_text_area(self.recognized_text_area, "", mode='clear_interim'))
+            self.recognized_text_has_interim = False # Ensure flag is cleared
+            self.current_recognized_sentence = ""
+            self._cancel_interim_stuck_check()
+            self.current_interim_start_time = None
 
 if __name__ == '__main__':
     root = tk.Tk()
