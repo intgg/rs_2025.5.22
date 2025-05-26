@@ -180,6 +180,14 @@ class SimultaneousTranslatorApp:
                     input_device_index=self.selected_input_device_idx # 使用选择的输入设备
                     # Add max_speech_segment_duration_seconds if we implement it in FunASR
                 )
+                if self.asr_instance: # 新增：确保实例存在
+                    try:
+                        self.asr_instance.silence_duration_threshold = 0.7  # 尝试新值
+                        # self.asr_instance.relative_silence_threshold = 0.2 # 可以按需调整
+                        self.log_message(f"FunASR静音参数已调整: duration_threshold={self.asr_instance.silence_duration_threshold}s")
+                    except AttributeError:
+                        self.log_message("警告: 无法动态修改FunASR的silence_duration_threshold属性。可能需要直接修改FunASR.py。")
+
                 threading.Thread(target=self._initial_model_load, daemon=True).start()
             except Exception as e:
                 self.log_message(f"创建FunASR实例失败: {e}")
@@ -443,9 +451,17 @@ class SimultaneousTranslatorApp:
                         text_output_callback=self.asr_text_callback,
                         input_device_index=self.selected_input_device_idx # 使用选择的输入设备
                     )
+                    if self.asr_instance: # 确保实例存在
+                        try:
+                            self.asr_instance.silence_duration_threshold = 0.7  # 尝试新值
+                            # self.asr_instance.relative_silence_threshold = 0.2 # 可以按需调整
+                            self.log_message(f"FunASR静音参数已调整 (re-init): duration_threshold={self.asr_instance.silence_duration_threshold}s")
+                        except AttributeError:
+                            self.log_message("警告: 无法动态修改FunASR的silence_duration_threshold属性 (re-init)。")
+                    
                     # Start model loading in a separate thread as it can be blocking
                     threading.Thread(target=self._initial_model_load, daemon=True).start()
-                    self.log_message("FunASR 实例已重新初始化，正在加载模型...")
+                    self.log_message("FunASR 实例已重新初始化，正在加载模型...") # 保留此日志
                 except Exception as e:
                     self.log_message(f"重新创建FunASR实例失败: {e}")
                     return # Exit if re-initialization fails
