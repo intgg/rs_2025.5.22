@@ -90,7 +90,7 @@ class FastLoadASR:
         self.asr_chunk_samples = int(self.sample_rate * self.asr_chunk_duration_ms / 1000)
 
         # 动态静音检测参数
-        self.relative_silence_threshold = 0.5  # 相对静音阈值（音量下降80%时触发）
+        self.relative_silence_threshold = 0.8  # 相对静音阈值（音量下降80%时触发）
         self.silence_duration_threshold = 0.5  # 静音持续时间阈值（1秒）
         self.silence_start_time = None  # 静音开始时间
         self.is_in_silence = False  # 是否处于静音状态

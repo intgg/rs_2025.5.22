@@ -77,6 +77,14 @@ class SimultaneousTranslatorApp:
         self.last_final_asr_text = ""
         self.recognized_text_has_interim = False
 
+        # ASR activity timeout logic
+        self.last_asr_activity_time = None
+        self.force_sentence_end_timeout = 1.0  # Seconds
+        self.asr_timeout_check_timer_id = None
+        self.raw_text_of_last_forced_sentence = None # New: Store raw text of the last sentence that was force-finalized
+
+        self.all_models_loaded = False # New: For model loading status
+
         # --- UI Elements ---
         control_frame = ttk.Frame(root, padding="10")
         control_frame.pack(fill=tk.X)
@@ -115,6 +123,32 @@ class SimultaneousTranslatorApp:
         self.tts_voice_dropdown = ttk.Combobox(lang_frame, textvariable=self.tts_voice_var, state="readonly", width=35)
         self.tts_voice_dropdown.pack(side=tk.LEFT, expand=True, fill=tk.X, padx=(0,10))
 
+        # ASR Settings Frame
+        asr_settings_frame = ttk.Frame(control_frame)
+        asr_settings_frame.pack(fill=tk.X, pady=(5,0))
+
+        ttk.Label(asr_settings_frame, text="ASR静音时长(s):").pack(side=tk.LEFT, padx=(0,5))
+        self.asr_silence_duration_var = tk.DoubleVar(value=0.5) # Default changed to 0.5
+        self.asr_silence_duration_scale = ttk.Scale(
+            asr_settings_frame, from_=0.1, to=2.0, # Range can be kept or adjusted if needed
+            variable=self.asr_silence_duration_var, orient=tk.HORIZONTAL,
+            command=self._update_asr_duration_label
+        )
+        self.asr_silence_duration_scale.pack(side=tk.LEFT, padx=(0,5), fill=tk.X, expand=True)
+        self.asr_silence_duration_label_var = tk.StringVar(value=f"{self.asr_silence_duration_var.get():.2f}s")
+        ttk.Label(asr_settings_frame, textvariable=self.asr_silence_duration_label_var, width=6).pack(side=tk.LEFT, padx=(0,10))
+
+        ttk.Label(asr_settings_frame, text="ASR相对静音阈值:").pack(side=tk.LEFT, padx=(0,5))
+        self.asr_relative_silence_var = tk.DoubleVar(value=0.5) # Default changed to 0.5
+        self.asr_relative_silence_scale = ttk.Scale(
+            asr_settings_frame, from_=0.0, to=1.0, # Range changed to 0.0 - 1.0
+            variable=self.asr_relative_silence_var, orient=tk.HORIZONTAL,
+            command=self._update_asr_relative_vol_label
+        )
+        self.asr_relative_silence_scale.pack(side=tk.LEFT, padx=(0,5), fill=tk.X, expand=True)
+        self.asr_relative_silence_label_var = tk.StringVar(value=f"{self.asr_relative_silence_var.get():.2f}")
+        ttk.Label(asr_settings_frame, textvariable=self.asr_relative_silence_label_var, width=5).pack(side=tk.LEFT, padx=(0,10))
+
         # TTS Prosody Controls Frame
         prosody_frame = ttk.Frame(control_frame)
         prosody_frame.pack(fill=tk.X, pady=(5, 0))
@@ -135,7 +169,7 @@ class SimultaneousTranslatorApp:
         self.tts_volume_label_var = tk.StringVar(value="0%")
         ttk.Label(prosody_frame, textvariable=self.tts_volume_label_var, width=5).pack(side=tk.LEFT, padx=(0,10))
 
-        self.start_stop_button = ttk.Button(control_frame, text="开始同传", command=self.toggle_translation, width=12)
+        self.start_stop_button = ttk.Button(control_frame, text="开始同传", command=self.toggle_translation, width=12, state="disabled")
         self.start_stop_button.pack(side=tk.RIGHT, padx=(10,0))
 
         text_frame = ttk.Frame(root, padding="5")
@@ -182,11 +216,14 @@ class SimultaneousTranslatorApp:
                 )
                 if self.asr_instance: # 新增：确保实例存在
                     try:
-                        self.asr_instance.silence_duration_threshold = 0.7  # 尝试新值
-                        # self.asr_instance.relative_silence_threshold = 0.2 # 可以按需调整
-                        self.log_message(f"FunASR静音参数已调整: duration_threshold={self.asr_instance.silence_duration_threshold}s")
+                        # 从UI控件获取初始值
+                        initial_duration = self.asr_silence_duration_var.get()
+                        initial_relative_vol = self.asr_relative_silence_var.get()
+                        self.asr_instance.silence_duration_threshold = initial_duration
+                        self.asr_instance.relative_silence_threshold = initial_relative_vol
+                        self.log_message(f"FunASR静音参数已初始化: Duration={initial_duration:.2f}s, RelativeVol={initial_relative_vol:.2f}")
                     except AttributeError:
-                        self.log_message("警告: 无法动态修改FunASR的silence_duration_threshold属性。可能需要直接修改FunASR.py。")
+                        self.log_message("警告: 无法动态修改FunASR的内部参数。可能需要直接修改FunASR.py。")
 
                 threading.Thread(target=self._initial_model_load, daemon=True).start()
             except Exception as e:
@@ -197,6 +234,10 @@ class SimultaneousTranslatorApp:
 
 
     def _initial_model_load(self):
+        self.all_models_loaded = False # Reset status at the beginning of load attempt
+        # Ensure button is disabled during this process, in case it was enabled before an error and retry
+        self.root.after(0, lambda: self.start_stop_button.config(state="disabled"))
+
         if self.asr_instance:
             self.log_message("正在加载ASR主模型 (如果尚未加载)...")
             if not self.asr_instance.ensure_asr_model_loaded():
@@ -216,12 +257,29 @@ class SimultaneousTranslatorApp:
             if self.asr_instance.use_punc:
                 self.log_message("正在加载标点模型 (如果需要)...")
                 if not self.asr_instance.load_punc_model_if_needed():
-                    self.log_message("标点模型加载失败。", True)
+                    self.log_message("标点模型加载失败。ASR将不带标点运行或无法运行。", True)
+                    # Depending on severity, you might want to set all_models_loaded to False and return
+                    # For now, we allow proceeding without punc if it fails but other models are OK.
+                    # However, for critical models like ASR main, we do return.
                 else:
                     self.log_message("标点模型已就绪或已加载。")
-            self.log_message("所有配置的ASR相关模型已检查/加载。")
+            
+            # Check if all critical models are loaded
+            # For this example, ASR main model is critical. VAD and Punc are optional enhancements.
+            if self.asr_instance.asr_model: # asr_model is the main one
+                self.all_models_loaded = True
+                self.log_message("所有核心ASR模型已成功加载/验证。")
+                self.root.after(0, lambda: self.start_stop_button.config(state="normal"))
+                self.root.after(0, lambda: self.log_message("模型加载完毕，可以开始同传。", True))
+            else:
+                self.all_models_loaded = False # Ensure it's false if main ASR model failed
+                self.log_message("ASR主模型加载失败，无法启动同传。", True)
+                self.root.after(0, lambda: self.start_stop_button.config(state="disabled"))
+
         else:
             self.log_message("ASR实例未创建，无法加载模型。")
+            self.all_models_loaded = False
+            self.root.after(0, lambda: self.start_stop_button.config(state="disabled"))
 
     def log_message(self, message, is_status=True):
         print(message)
@@ -439,11 +497,18 @@ class SimultaneousTranslatorApp:
             self.start_translation_process()
 
     def start_translation_process(self):
+        if not self.all_models_loaded:
+            self.log_message("错误：模型尚未完全加载，请稍候或检查日志。", True)
+            # Optionally, try to trigger a reload if it failed previously and not currently loading
+            # For now, just inform the user.
+            return
+
         if not self.asr_instance: # Check if ASR instance was created
             self.log_message("错误：FunASR实例未初始化，无法开始。", True)
-            # Try to re-initialize ASR instance if it's None and FastLoadASR is available
             if FastLoadASR and not self.asr_instance:
                 self.log_message("尝试重新初始化 FunASR 实例...")
+                self.all_models_loaded = False # Mark models as not loaded before re-init
+                self.start_stop_button.config(state="disabled") # Disable button during re-load
                 try:
                     self.asr_instance = FastLoadASR(
                         use_vad=True,
@@ -453,17 +518,22 @@ class SimultaneousTranslatorApp:
                     )
                     if self.asr_instance: # 确保实例存在
                         try:
-                            self.asr_instance.silence_duration_threshold = 0.7  # 尝试新值
-                            # self.asr_instance.relative_silence_threshold = 0.2 # 可以按需调整
-                            self.log_message(f"FunASR静音参数已调整 (re-init): duration_threshold={self.asr_instance.silence_duration_threshold}s")
+                            # 从UI控件获取当前值进行配置
+                            current_duration = self.asr_silence_duration_var.get()
+                            current_relative_vol = self.asr_relative_silence_var.get()
+                            self.asr_instance.silence_duration_threshold = current_duration
+                            self.asr_instance.relative_silence_threshold = current_relative_vol
+                            self.log_message(f"FunASR静音参数已配置 (re-init): Duration={current_duration:.2f}s, RelativeVol={current_relative_vol:.2f}")
                         except AttributeError:
-                            self.log_message("警告: 无法动态修改FunASR的silence_duration_threshold属性 (re-init)。")
+                            self.log_message("警告: 无法动态修改FunASR的内部参数 (re-init)。")
                     
                     # Start model loading in a separate thread as it can be blocking
                     threading.Thread(target=self._initial_model_load, daemon=True).start()
                     self.log_message("FunASR 实例已重新初始化，正在加载模型...") # 保留此日志
                 except Exception as e:
                     self.log_message(f"重新创建FunASR实例失败: {e}")
+                    self.all_models_loaded = False # Ensure flag is false on failure
+                    self.start_stop_button.config(state="disabled") # Keep disabled
                     return # Exit if re-initialization fails
             else:
                  return # Exit if FastLoadASR not available or instance still None
@@ -500,6 +570,13 @@ class SimultaneousTranslatorApp:
         self.current_recognized_sentence = ""
         self.last_final_asr_text = ""
         self.recognized_text_has_interim = False
+        
+        # Reset and start ASR activity timer
+        self.last_asr_activity_time = time.time() # Initialize/reset activity time
+        if self.asr_timeout_check_timer_id:
+            self.root.after_cancel(self.asr_timeout_check_timer_id)
+            self.asr_timeout_check_timer_id = None
+        self._check_asr_activity_timeout() # Start the timeout check loop
 
         # Start ASR instance (this should reset its internal state, not reload models)
         try:
@@ -526,10 +603,15 @@ class SimultaneousTranslatorApp:
                 self.log_message(f"停止FunASR时出错: {e}")
 
         self.is_running = False # Set to false to signal worker threads to stop
+        # Stop ASR activity timeout check BEFORE changing button text and logging stop, to ensure it's cleanly handled
+        if self.asr_timeout_check_timer_id:
+            self.root.after_cancel(self.asr_timeout_check_timer_id)
+            self.asr_timeout_check_timer_id = None
+            self.log_message("ASR活动超时检查已停止。")
+
         self.start_stop_button.config(text="开始同传")
 
         # Clear queues after stopping ASR and setting is_running to false
-        # Give a moment for worker threads to see is_running=False and process remaining queue items
         self.root.after(100, self._clear_queues)
         self.log_message("同声传译已停止。", True)
 
@@ -542,12 +624,14 @@ class SimultaneousTranslatorApp:
 
     def asr_text_callback(self, recognized_segment, current_full_sentence, is_sentence_end):
         if not self.is_running: return
+        self.last_asr_activity_time = time.time() # Update activity time
 
         if is_sentence_end:
             final_text = current_full_sentence.strip()
             if final_text and final_text != self.last_final_asr_text:
                 self.log_message(f"ASR (Final): {final_text}")
                 self.last_final_asr_text = final_text
+                self.raw_text_of_last_forced_sentence = None # Clear this as ASR provided a proper end
                 update_mode = 'replace_interim_with_final' if self.recognized_text_has_interim else 'append_final'
                 self.root.after(0, lambda: self._update_text_area(self.recognized_text_area, final_text + "\n", mode=update_mode))
                 self.asr_output_queue.put(final_text)
@@ -561,10 +645,92 @@ class SimultaneousTranslatorApp:
                 self.log_message(f"ASR (Duplicate Final Ignored): {final_text}")
             self.current_recognized_sentence = ""
         else:
-            self.current_recognized_sentence = current_full_sentence
-            self.log_message(f"ASR (Interim): {recognized_segment}")
+            # Handle interim results more carefully
+            current_full_sentence_from_asr = current_full_sentence # Keep original for clarity
+            
+            prefix_to_check_against = None
+            if self.raw_text_of_last_forced_sentence:
+                prefix_to_check_against = self.raw_text_of_last_forced_sentence
+            elif self.last_final_asr_text: # If no raw forced text, use the last final text (which might have punc)
+                # Basic attempt to strip common sentence-ending punctuation for comparison
+                # This is a heuristic and might not be perfect.
+                stripped_last_final = self.last_final_asr_text.strip()
+                if stripped_last_final.endswith(('.', '。', '?', '？', '!', '！')):
+                    stripped_last_final = stripped_last_final[:-1]
+                prefix_to_check_against = stripped_last_final.strip() 
+
+            if prefix_to_check_against and current_full_sentence_from_asr.startswith(prefix_to_check_against):
+                potential_new_segment = current_full_sentence_from_asr[len(prefix_to_check_against):].lstrip()
+                if potential_new_segment: 
+                    # self.current_recognized_sentence = prefix_to_check_against + " " + potential_new_segment
+                    # Let's make self.current_recognized_sentence represent the full line as ASR sees it for now.
+                    # The UI update logic in _update_text_area for 'update_interim' should handle replacing the line.
+                    self.current_recognized_sentence = current_full_sentence_from_asr
+                else:
+                    if recognized_segment:
+                         self.log_message(f"ASR (Interim segment, but no new full sentence change from prefix): {recognized_segment}")
+                    return 
+            else:
+                 self.current_recognized_sentence = current_full_sentence_from_asr
+
+            self.log_message(f"ASR (Interim Update): {self.current_recognized_sentence} (Segment: {recognized_segment})")
             self.root.after(0, lambda: self._update_text_area(self.recognized_text_area, self.current_recognized_sentence, mode='update_interim'))
             self.recognized_text_has_interim = True
+            # Do not schedule a new timeout check here, it's handled by start_translation_process
+
+    def _force_finalize_current_sentence(self):
+        if not self.is_running or not self.current_recognized_sentence: # Extra check
+            return
+
+        final_text_unpunc = self.current_recognized_sentence.strip()
+        self.raw_text_of_last_forced_sentence = final_text_unpunc # Store the raw text before punctuation
+        final_text = final_text_unpunc # Default to unpunctuated
+
+        # Attempt to apply punctuation if model is available
+        if self.asr_instance and hasattr(self.asr_instance, 'punc_model') and self.asr_instance.punc_model and \
+           hasattr(self.asr_instance, 'use_punc') and self.asr_instance.use_punc and final_text_unpunc:
+            try:
+                self.log_message(f"Attempting to punctuate forced-final text: {final_text_unpunc}")
+                punc_res = self.asr_instance.punc_model.generate(final_text_unpunc)
+                # FunASR punc model typically returns a list of dicts, e.g., [{'text': 'punctuated text'}]
+                if punc_res and isinstance(punc_res, list) and len(punc_res) > 0 and 'text' in punc_res[0]:
+                    final_text = punc_res[0]['text']
+                    self.log_message(f"Punctuation applied to forced-final: {final_text}")
+                else:
+                    self.log_message(f"Punctuation model returned unexpected result for '{final_text_unpunc}'. Using unpunctuated.")
+            except Exception as e:
+                self.log_message(f"Error applying punctuation to forced-final text '{final_text_unpunc}': {e}. Using unpunctuated.")
+        
+        self.log_message(f"ASR (Forced Final due to timeout): {final_text}")
+        
+        # Similar logic to normal finalization in asr_text_callback
+        if final_text and final_text != self.last_final_asr_text:
+            self.last_final_asr_text = final_text
+            update_mode = 'replace_interim_with_final' if self.recognized_text_has_interim else 'append_final'
+            self.root.after(0, lambda: self._update_text_area(self.recognized_text_area, final_text + "\n", mode=update_mode))
+            self.asr_output_queue.put(final_text)
+        elif not final_text and self.recognized_text_has_interim: # Handle case where interim was there but final is empty
+            self.root.after(0, lambda: self._update_text_area(self.recognized_text_area, "", mode='clear_interim'))
+
+        self.current_recognized_sentence = "" # Crucial: clear current sentence
+        self.recognized_text_has_interim = False
+        self.last_asr_activity_time = None # Reset to prevent immediate re-trigger if no new audio
+
+    def _check_asr_activity_timeout(self):
+        if not self.is_running: # Stop if service is stopped
+            if self.asr_timeout_check_timer_id:
+                self.root.after_cancel(self.asr_timeout_check_timer_id)
+                self.asr_timeout_check_timer_id = None
+            return
+
+        if self.current_recognized_sentence and self.last_asr_activity_time:
+            if (time.time() - self.last_asr_activity_time) > self.force_sentence_end_timeout:
+                self.log_message("ASR activity timeout detected. Forcing sentence finalization.")
+                self._force_finalize_current_sentence()
+        
+        # Reschedule the check
+        if self.is_running: # Only reschedule if still running
+             self.asr_timeout_check_timer_id = self.root.after(200, self._check_asr_activity_timeout) # Check every 200ms
 
     def translation_worker(self):
         while True:
@@ -721,6 +887,41 @@ class SimultaneousTranslatorApp:
         self.log_message("正在销毁UI...")
         self.root.destroy()
         print("应用已关闭。")
+
+    def _update_asr_duration_label(self, value_str):
+        try:
+            val = float(value_str)
+            self.asr_silence_duration_label_var.set(f"{val:.2f}s")
+            self._apply_asr_settings_to_instance()
+        except ValueError:
+            pass # Ignore if value is not a float yet (can happen during slider drag)
+
+    def _update_asr_relative_vol_label(self, value_str):
+        try:
+            val = float(value_str)
+            self.asr_relative_silence_label_var.set(f"{val:.2f}")
+            self._apply_asr_settings_to_instance()
+        except ValueError:
+            pass # Ignore
+
+    def _apply_asr_settings_to_instance(self):
+        if self.asr_instance and self.is_running: # Apply only if ASR is active
+            try:
+                duration = self.asr_silence_duration_var.get()
+                relative_vol = self.asr_relative_silence_var.get()
+                self.asr_instance.silence_duration_threshold = duration
+                self.asr_instance.relative_silence_threshold = relative_vol
+                # Log less frequently to avoid spamming, perhaps only on significant changes or after a delay
+                # For now, we log every time for debugging.
+                self.log_message(f"实时更新FunASR参数: Duration={duration:.2f}s, RelativeVol={relative_vol:.2f}")
+            except AttributeError:
+                self.log_message("警告: 无法动态修改FunASR的内部参数 (实时更新失败)。")
+            except Exception as e:
+                self.log_message(f"实时更新FunASR参数时出错: {e}")
+        elif self.asr_instance and not self.is_running:
+             # Store for next run, or simply let the init/start_translation_process handle it.
+             # For now, we do nothing if not running, as init/start will pick up current UI values.
+             pass
 
 if __name__ == '__main__':
     root = tk.Tk()
